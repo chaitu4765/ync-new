@@ -246,12 +246,21 @@ function prevSlide() {
             </div>
           </div>
 
-          <div class="mt-8">
+          <div class="mt-8 flex flex-col sm:flex-row gap-4 items-center">
             <InteractiveHoverButton
               text="SECURE BOARDING PASS"
               @click="openRegistration(eventStore.events[activeIndex].id)"
               class="w-full sm:w-auto text-xs tracking-widest"
             />
+            
+            <a
+              href="https://forms.gle/2JfCxTawPJachhL47"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="w-full sm:w-auto px-6 py-4 rounded-full border border-white/8 bg-white/3 backdrop-blur-sm text-text-primary text-center font-sans font-bold tracking-[0.2em] text-[10px] uppercase transition-all duration-400 hover:border-gold-primary/30 hover:bg-gold-primary/5 hover:shadow-[0_0_20px_rgba(217,178,122,0.08)] focus:outline-none cursor-pointer"
+            >
+              Google Form Registry
+            </a>
           </div>
         </div>
 
