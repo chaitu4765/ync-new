@@ -1,5 +1,27 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
+import { auth, db } from '@/lib/firebase';
+import {
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+  signInWithPopup,
+  GoogleAuthProvider,
+  GithubAuthProvider
+} from 'firebase/auth';
+import {
+  doc,
+  setDoc,
+  getDoc,
+  collection,
+  onSnapshot,
+  updateDoc,
+  addDoc,
+  query,
+  orderBy,
+  getDocs
+} from 'firebase/firestore';
 
 export interface UserProfile {
   name: string;
@@ -36,49 +58,7 @@ export interface EventRegistration {
 }
 
 export const useAuthStore = defineStore('auth', () => {
-  // Load users from localStorage, or seed default database
-  const defaultUsers: UserProfile[] = [
-    {
-      name: 'Central Admin Office',
-      email: 'admin@ync.community',
-      role: 'admin',
-      memberId: 'YNC-ORBIT-001',
-      joinedDate: '2023-01-05',
-      level: 10,
-      xp: 4500,
-      badges: ['Genesis Circle', 'Constellation Architect', 'Executive Lead'],
-      profilePic: 'AV'
-    },
-    {
-      name: 'Aurelia Vance',
-      email: 'aurelia@ync.community',
-      role: 'member',
-      memberId: 'YNC-MEMBER-101',
-      joinedDate: '2023-03-10',
-      level: 5,
-      xp: 2200,
-      badges: ['Genesis Circle', 'Summit Curator'],
-      profilePic: 'AV',
-      academicUnit: 'Stanford University (CS)',
-      skills: ['Vue', 'Design Systems', 'Strategy'],
-      interests: ['Networking', 'Leadership']
-    },
-    {
-      name: 'Kaelen Sterling',
-      email: 'kaelen@ync.community',
-      role: 'member',
-      memberId: 'YNC-MEMBER-102',
-      joinedDate: '2023-08-15',
-      level: 4,
-      xp: 1600,
-      badges: ['Developer Orbit', 'Innovation Award'],
-      profilePic: 'KS',
-      academicUnit: 'MIT (AI Research)',
-      skills: ['Python', 'Rust', 'Cloud Systems'],
-      interests: ['Hackathons', 'AI/ML']
-    }
-  ];
-
+  // Default values to seed if Firestore is empty
   const defaultAnnouncements: Announcement[] = [
     {
       id: 1,
@@ -120,234 +100,395 @@ export const useAuthStore = defineStore('auth', () => {
   ];
 
   // Initialize State
-  const users = ref<UserProfile[]>(JSON.parse(localStorage.getItem('ync_users') || 'null') || defaultUsers);
-  const announcements = ref<Announcement[]>(JSON.parse(localStorage.getItem('ync_announcements') || 'null') || defaultAnnouncements);
-  const registrations = ref<EventRegistration[]>(JSON.parse(localStorage.getItem('ync_registrations') || 'null') || defaultRegistrations);
-  
-  const currentUser = ref<UserProfile | null>(JSON.parse(localStorage.getItem('ync_current_user') || 'null'));
+  const users = ref<UserProfile[]>([]);
+  const announcements = ref<Announcement[]>([]);
+  const registrations = ref<EventRegistration[]>([]);
+  const currentUser = ref<UserProfile | null>(null);
+
   const isAuthed = computed(() => currentUser.value !== null);
   const isAdmin = computed(() => currentUser.value?.role === 'admin');
 
-  // Helper sync
-  function syncDB() {
-    localStorage.setItem('ync_users', JSON.stringify(users.value));
-    localStorage.setItem('ync_announcements', JSON.stringify(announcements.value));
-    localStorage.setItem('ync_registrations', JSON.stringify(registrations.value));
-    if (currentUser.value) {
-      localStorage.setItem('ync_current_user', JSON.stringify(currentUser.value));
-    } else {
-      localStorage.removeItem('ync_current_user');
+  let unsubscribeAnnouncements: (() => void) | null = null;
+  let unsubscribeRegistrations: (() => void) | null = null;
+  let unsubscribeUsers: (() => void) | null = null;
+
+  // Real-time listeners setup
+  function setupListeners() {
+    // Clear any existing listeners first
+    if (unsubscribeAnnouncements) unsubscribeAnnouncements();
+    if (unsubscribeRegistrations) unsubscribeRegistrations();
+    if (unsubscribeUsers) unsubscribeUsers();
+
+    // Listen to announcements
+    const announcementsRef = collection(db, 'announcements');
+    const announcementsQuery = query(announcementsRef, orderBy('date', 'desc'));
+    unsubscribeAnnouncements = onSnapshot(announcementsQuery, (snapshot) => {
+      const list: Announcement[] = [];
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data();
+        list.push({
+          id: data.id || parseInt(docSnap.id) || Math.random(),
+          title: data.title,
+          body: data.body,
+          date: data.date
+        });
+      });
+      announcements.value = list;
+
+      // Seed default announcements if empty
+      if (list.length === 0 && currentUser.value?.role === 'admin') {
+        seedDefaultAnnouncements();
+      }
+    });
+
+    // Listen to registrations
+    const regsRef = collection(db, 'registrations');
+    unsubscribeRegistrations = onSnapshot(regsRef, (snapshot) => {
+      const list: EventRegistration[] = [];
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data();
+        list.push({
+          id: data.id,
+          memberName: data.memberName,
+          memberEmail: data.memberEmail,
+          memberId: data.memberId,
+          eventName: data.eventName,
+          eventId: data.eventId,
+          role: data.role,
+          status: data.status,
+          appliedDate: data.appliedDate,
+          dbId: docSnap.id // Custom field to track document ID
+        } as any);
+      });
+      registrations.value = list;
+
+      // Seed default registrations if empty
+      if (list.length === 0 && currentUser.value?.role === 'admin') {
+        seedDefaultRegistrations();
+      }
+    });
+
+    // Setup cadet user lists for admin dashboard
+    if (currentUser.value?.role === 'admin') {
+      const usersRef = collection(db, 'users');
+      unsubscribeUsers = onSnapshot(usersRef, (snapshot) => {
+        const list: UserProfile[] = [];
+        snapshot.forEach((docSnap) => {
+          list.push(docSnap.data() as UserProfile);
+        });
+        users.value = list;
+      });
     }
   }
 
-  function login(email: string, pass: string, _remember: boolean = false): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      setTimeout(() => {
-        // Simple mock authentication check
-        const matched = users.value.find(u => u.email.toLowerCase() === email.toLowerCase());
-        if (matched) {
-          // If preseeded, allow bypass with correct credentials simulated (any password for mock or email-matching pass)
-          if (email === 'admin@ync.community' && pass !== 'admin123') {
-            reject('Invalid administrator credentials.');
-            return;
-          }
-          currentUser.value = matched;
-          syncDB();
-          resolve(true);
-        } else {
-          reject('No credentials matching this address were logged.');
-        }
-      }, 1000);
-    });
-  }
+  // Firebase Auth Observer
+  onAuthStateChanged(auth, async (firebaseUser) => {
+    if (firebaseUser) {
+      const userRef = doc(db, 'users', firebaseUser.uid);
+      const userSnap = await getDoc(userRef);
 
-  function register(formData: Partial<UserProfile> & { pass: string }): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      setTimeout(() => {
-        const exists = users.value.some(u => u.email.toLowerCase() === formData.email?.toLowerCase());
-        if (exists) {
-          reject('This email address is already logged.');
-          return;
-        }
-
-        const newId = `YNC-MEMBER-${100 + users.value.length + 1}`;
-        const newMember: UserProfile = {
-          name: formData.name || 'Member',
-          email: formData.email || '',
-          role: 'member',
-          memberId: newId,
+      if (userSnap.exists()) {
+        currentUser.value = userSnap.data() as UserProfile;
+      } else {
+        const name = firebaseUser.displayName || 'Stardust Explorer';
+        const role = firebaseUser.email === 'admin@ync.community' ? 'admin' : 'member';
+        const profilePic = name.split(' ').map(n => n[0]).join('').toUpperCase() || 'Y';
+        
+        const newProfile: UserProfile = {
+          name,
+          email: firebaseUser.email || '',
+          role,
+          memberId: `YNC-MEMBER-${Math.floor(Math.random() * 10000)}`,
           joinedDate: new Date().toISOString().split('T')[0],
           level: 1,
-          xp: 150, // Starter XP
+          xp: 150,
           badges: ['Cosmic Cadet'],
-          profilePic: formData.name ? formData.name.split(' ').map(n=>n[0]).join('').toUpperCase() : 'YNC',
-          academicUnit: formData.academicUnit || 'TBD',
-          skills: formData.skills || [],
-          interests: formData.interests || []
+          profilePic,
+          academicUnit: 'International Chapter',
+          skills: [],
+          interests: []
         };
+        await setDoc(userRef, newProfile);
+        currentUser.value = newProfile;
+      }
+      setupListeners();
+    } else {
+      currentUser.value = null;
+      announcements.value = [];
+      registrations.value = [];
+      users.value = [];
+      if (unsubscribeAnnouncements) unsubscribeAnnouncements();
+      if (unsubscribeRegistrations) unsubscribeRegistrations();
+      if (unsubscribeUsers) unsubscribeUsers();
+    }
+  });
 
-        users.value.push(newMember);
-        currentUser.value = newMember;
-        syncDB();
-        resolve(true);
-      }, 1200);
-    });
+  async function seedDefaultAnnouncements() {
+    const announcementsRef = collection(db, 'announcements');
+    for (const ann of defaultAnnouncements) {
+      await addDoc(announcementsRef, ann);
+    }
   }
 
-  function loginWithGoogle(): Promise<boolean> {
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        const googleUser: UserProfile = {
-          name: 'Stardust Explorer',
-          email: 'explorer@gmail.com',
+  async function seedDefaultRegistrations() {
+    const registrationsRef = collection(db, 'registrations');
+    for (const reg of defaultRegistrations) {
+      await addDoc(registrationsRef, reg);
+    }
+  }
+
+  async function login(email: string, pass: string, _remember: boolean = false): Promise<boolean> {
+    try {
+      const userCredential = await signInWithEmailAndPassword(auth, email, pass);
+      const user = userCredential.user;
+      
+      const userRef = doc(db, 'users', user.uid);
+      const snap = await getDoc(userRef);
+      if (snap.exists()) {
+        currentUser.value = snap.data() as UserProfile;
+      }
+      return true;
+    } catch (error: any) {
+      // Auto-provision admin credentials inside Firebase if they do not exist
+      if (email.toLowerCase() === 'admin@ync.community' && pass === 'admin123') {
+        try {
+          const userCredential = await createUserWithEmailAndPassword(auth, email, pass);
+          const user = userCredential.user;
+          const adminProfile: UserProfile = {
+            name: 'Central Admin Office',
+            email: 'admin@ync.community',
+            role: 'admin',
+            memberId: 'YNC-ORBIT-001',
+            joinedDate: new Date().toISOString().split('T')[0],
+            level: 10,
+            xp: 4500,
+            badges: ['Genesis Circle', 'Constellation Architect', 'Executive Lead'],
+            profilePic: 'AV'
+          };
+          await setDoc(doc(db, 'users', user.uid), adminProfile);
+          currentUser.value = adminProfile;
+          return true;
+        } catch (err: any) {
+          throw err.message || err;
+        }
+      }
+      throw error.message || 'Invalid credentials.';
+    }
+  }
+
+  async function register(formData: Partial<UserProfile> & { pass: string }): Promise<boolean> {
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, formData.email!, formData.pass);
+      const user = userCredential.user;
+
+      const newId = `YNC-MEMBER-${Math.floor(Math.random() * 900) + 100}`;
+      const newMember: UserProfile = {
+        name: formData.name || 'Member',
+        email: formData.email || '',
+        role: 'member',
+        memberId: newId,
+        joinedDate: new Date().toISOString().split('T')[0],
+        level: 1,
+        xp: 150,
+        badges: ['Cosmic Cadet'],
+        profilePic: formData.name ? formData.name.split(' ').map(n=>n[0]).join('').toUpperCase() : 'YNC',
+        academicUnit: formData.academicUnit || 'TBD',
+        skills: formData.skills || [],
+        interests: formData.interests || []
+      };
+
+      await setDoc(doc(db, 'users', user.uid), newMember);
+      currentUser.value = newMember;
+      return true;
+    } catch (error: any) {
+      throw error.message || 'Registration failed.';
+    }
+  }
+
+  async function loginWithGoogle(): Promise<boolean> {
+    try {
+      const provider = new GoogleAuthProvider();
+      const userCredential = await signInWithPopup(auth, provider);
+      const user = userCredential.user;
+      
+      const userRef = doc(db, 'users', user.uid);
+      const snap = await getDoc(userRef);
+      if (!snap.exists()) {
+        const name = user.displayName || 'Stardust Explorer';
+        const profilePic = name.split(' ').map(n=>n[0]).join('').toUpperCase() || 'SE';
+        
+        const newMember: UserProfile = {
+          name,
+          email: user.email || '',
           role: 'member',
-          memberId: `YNC-MEMBER-${100 + users.value.length + 1}`,
+          memberId: `YNC-MEMBER-${Math.floor(Math.random() * 900) + 100}`,
           joinedDate: new Date().toISOString().split('T')[0],
           level: 1,
           xp: 200,
           badges: ['Google Boarding', 'Cosmic Cadet'],
-          profilePic: 'SE',
+          profilePic,
           academicUnit: 'International Chapter',
           skills: ['Growth', 'Public Speaking'],
           interests: ['Networking']
         };
-        users.value.push(googleUser);
-        currentUser.value = googleUser;
-        syncDB();
-        resolve(true);
-      }, 1000);
-    });
+        await setDoc(userRef, newMember);
+        currentUser.value = newMember;
+      } else {
+        currentUser.value = snap.data() as UserProfile;
+      }
+      return true;
+    } catch (error: any) {
+      throw error.message || 'Google Auth failed.';
+    }
   }
 
-  function loginWithGithub(): Promise<boolean> {
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        const githubUser: UserProfile = {
-          name: 'Git Octocat',
-          email: 'octo@github.com',
+  async function loginWithGithub(): Promise<boolean> {
+    try {
+      const provider = new GithubAuthProvider();
+      const userCredential = await signInWithPopup(auth, provider);
+      const user = userCredential.user;
+      
+      const userRef = doc(db, 'users', user.uid);
+      const snap = await getDoc(userRef);
+      if (!snap.exists()) {
+        const name = user.displayName || 'Git Octocat';
+        const profilePic = name.split(' ').map(n=>n[0]).join('').toUpperCase() || 'GO';
+        
+        const newMember: UserProfile = {
+          name,
+          email: user.email || '',
           role: 'member',
-          memberId: `YNC-MEMBER-${100 + users.value.length + 1}`,
+          memberId: `YNC-MEMBER-${Math.floor(Math.random() * 900) + 100}`,
           joinedDate: new Date().toISOString().split('T')[0],
           level: 2,
           xp: 400,
           badges: ['GitHub Boarding', 'Builder Circle'],
-          profilePic: 'GO',
+          profilePic,
           academicUnit: 'Open Source Chapter',
           skills: ['TypeScript', 'Git', 'Vite'],
           interests: ['Hackathons', 'Innovation']
         };
-        users.value.push(githubUser);
-        currentUser.value = githubUser;
-        syncDB();
-        resolve(true);
-      }, 1000);
-    });
+        await setDoc(userRef, newMember);
+        currentUser.value = newMember;
+      } else {
+        currentUser.value = snap.data() as UserProfile;
+      }
+      return true;
+    } catch (error: any) {
+      throw error.message || 'GitHub Auth failed.';
+    }
   }
 
-  function logout() {
+  async function logout() {
+    await signOut(auth);
     currentUser.value = null;
-    localStorage.removeItem('ync_current_user');
   }
 
-  function awardXP(amount: number, reason: string): string {
-    if (!currentUser.value) return '';
-    console.log(`[XP TELEMETRY] Granted ${amount} XP. Directive: ${reason}`);
-    currentUser.value.xp += amount;
+  async function awardXP(amount: number, reason: string): Promise<string> {
+    if (!currentUser.value || !auth.currentUser) return '';
+    console.log(`[XP TELEMETRY] Granting ${amount} XP. Reason: ${reason}`);
     
-    // Check level thresholds (e.g. 500 XP per level)
+    currentUser.value.xp += amount;
     const newLevel = Math.floor(currentUser.value.xp / 500) + 1;
     let leveledUpMessage = '';
     
     if (newLevel > currentUser.value.level) {
       currentUser.value.level = newLevel;
       leveledUpMessage = `Level Up! You reached level ${newLevel}!`;
-      // Award leveling badge
       const levelBadge = `Level ${newLevel} Core`;
       if (!currentUser.value.badges.includes(levelBadge)) {
         currentUser.value.badges.push(levelBadge);
       }
     }
 
-    // Sync state into users database
-    const idx = users.value.findIndex(u => u.memberId === currentUser.value?.memberId);
-    if (idx !== -1) {
-      users.value[idx] = currentUser.value;
-    }
-    syncDB();
+    const userRef = doc(db, 'users', auth.currentUser.uid);
+    await setDoc(userRef, currentUser.value);
     
     return leveledUpMessage;
   }
 
-  function applyForEventPass(eventId: number, eventName: string, role: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      setTimeout(() => {
-        if (!currentUser.value) return resolve(false);
+  async function applyForEventPass(eventId: number, eventName: string, role: string): Promise<boolean> {
+    if (!currentUser.value || !auth.currentUser) return false;
 
-        // Check if already registered
-        const exists = registrations.value.some(
-          r => r.eventId === eventId && r.memberId === currentUser.value?.memberId
-        );
-        if (exists) return resolve(true);
+    const exists = registrations.value.some(
+      r => r.eventId === eventId && r.memberId === currentUser.value?.memberId
+    );
+    if (exists) return true;
 
-        const newReg: EventRegistration = {
-          id: registrations.value.length + 1,
-          memberName: currentUser.value.name,
-          memberEmail: currentUser.value.email,
-          memberId: currentUser.value.memberId,
-          eventName,
-          eventId,
-          role,
-          status: 'pending',
-          appliedDate: new Date().toISOString().split('T')[0]
-        };
+    const regId = Math.floor(Math.random() * 100000);
+    const newReg: EventRegistration = {
+      id: regId,
+      memberName: currentUser.value.name,
+      memberEmail: currentUser.value.email,
+      memberId: currentUser.value.memberId,
+      eventName,
+      eventId,
+      role,
+      status: 'pending',
+      appliedDate: new Date().toISOString().split('T')[0]
+    };
 
-        registrations.value.push(newReg);
-        syncDB();
-        
-        // Award XP for participating
-        awardXP(100, `Applied for ${eventName}`);
-        resolve(true);
-      }, 1000);
-    });
+    await addDoc(collection(db, 'registrations'), newReg);
+    await awardXP(100, `Applied for ${eventName}`);
+    return true;
   }
 
-  // Admin Actions
-  function approvePass(regId: number) {
-    const idx = registrations.value.findIndex(r => r.id === regId);
-    if (idx !== -1) {
-      registrations.value[idx].status = 'approved';
-      
-      // Award XP to that user
-      const member = users.value.find(u => u.memberId === registrations.value[idx].memberId);
-      if (member) {
-        member.xp += 150; // Approving passes awards extra XP
-        const newLevel = Math.floor(member.xp / 500) + 1;
-        if (newLevel > member.level) {
-          member.level = newLevel;
-          member.badges.push(`Level ${newLevel} Core`);
-        }
+  async function approvePass(regId: number) {
+    const regItem = registrations.value.find(r => r.id === regId);
+    if (!regItem) return;
+
+    const regDocId = (regItem as any).dbId;
+    if (regDocId) {
+      const regRef = doc(db, 'registrations', regDocId);
+      await updateDoc(regRef, { status: 'approved' });
+    }
+
+    // Find and update user's XP in Firestore
+    const usersRef = collection(db, 'users');
+    const q = query(usersRef);
+    const snap = await getDocs(q);
+    let userUidToUpdate: string | null = null;
+    let targetUser: UserProfile | null = null;
+
+    snap.forEach((docSnap) => {
+      const u = docSnap.data() as UserProfile;
+      if (u.memberId === regItem.memberId) {
+        userUidToUpdate = docSnap.id;
+        targetUser = u;
       }
-      syncDB();
+    });
+
+    if (userUidToUpdate && targetUser) {
+      const userToUpdate = targetUser as UserProfile;
+      userToUpdate.xp += 150;
+      const newLevel = Math.floor(userToUpdate.xp / 500) + 1;
+      if (newLevel > userToUpdate.level) {
+        userToUpdate.level = newLevel;
+        userToUpdate.badges.push(`Level ${newLevel} Core`);
+      }
+      await setDoc(doc(db, 'users', userUidToUpdate), userToUpdate);
     }
   }
 
-  function rejectPass(regId: number) {
-    const idx = registrations.value.findIndex(r => r.id === regId);
-    if (idx !== -1) {
-      registrations.value[idx].status = 'rejected';
-      syncDB();
+  async function rejectPass(regId: number) {
+    const regItem = registrations.value.find(r => r.id === regId);
+    if (!regItem) return;
+
+    const regDocId = (regItem as any).dbId;
+    if (regDocId) {
+      const regRef = doc(db, 'registrations', regDocId);
+      await updateDoc(regRef, { status: 'rejected' });
     }
   }
 
-  function createAnnouncement(title: string, body: string) {
-    const newAnn: Announcement = {
-      id: announcements.value.length + 1,
+  async function createAnnouncement(title: string, body: string) {
+    const newAnn = {
+      id: Math.floor(Math.random() * 100000),
       title,
       body,
       date: new Date().toISOString().split('T')[0]
     };
-    announcements.value.unshift(newAnn);
-    syncDB();
+    await addDoc(collection(db, 'announcements'), newAnn);
   }
 
   return {

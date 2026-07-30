@@ -31,10 +31,10 @@ function handleLogout() {
 const checkedIn = ref(false);
 const xpAlert = ref('');
 
-function claimDailyCheckin() {
+async function claimDailyCheckin() {
   if (checkedIn.value) return;
   checkedIn.value = true;
-  const msg = authStore.awardXP(100, 'Daily Terminal Check-in');
+  const msg = await authStore.awardXP(100, 'Daily Terminal Check-in');
   xpAlert.value = msg || 'Gained +100 XP!';
   setTimeout(() => {
     xpAlert.value = '';
